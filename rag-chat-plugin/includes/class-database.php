@@ -339,20 +339,35 @@ class RAG_Chat_Database {
     }
 
     /**
-     * Search scraped content
+     * Search scraped content with improved security and performance
      *
      * @param string $query Search query
      * @param int $limit Results limit
      * @return array Results
      */
     public function search_scraped_content($query, $limit = 10) {
-        $search_terms = explode(' ', sanitize_text_field($query));
+        // Sanitize and validate input
+        $query = sanitize_text_field($query);
+        $limit = absint($limit);
+        
+        if (empty($query) || $limit <= 0) {
+            return array();
+        }
+
+        // Split query into terms and sanitize each
+        $search_terms = array_filter(array_map('trim', explode(' ', $query)));
+        $search_terms = array_slice($search_terms, 0, 10); // Limit to 10 terms for performance
+        
+        if (empty($search_terms)) {
+            return array();
+        }
+
+        // Build WHERE clause with proper escaping
         $where_clauses = array();
         $params = array();
 
         foreach ($search_terms as $term) {
-            $term = trim($term);
-            if (!empty($term)) {
+            if (strlen($term) >= 2) { // Only search terms with 2+ characters
                 $where_clauses[] = "(title LIKE %s OR content LIKE %s)";
                 $params[] = '%' . $this->wpdb->esc_like($term) . '%';
                 $params[] = '%' . $this->wpdb->esc_like($term) . '%';
@@ -366,18 +381,30 @@ class RAG_Chat_Database {
         $where_sql = implode(' AND ', $where_clauses);
         $params[] = $limit;
 
-        $sql = "SELECT *, 
-                MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE) as relevance
-                FROM {$this->scraped_content_table} 
-                WHERE status = 'active' AND ({$where_sql})
-                ORDER BY relevance DESC, updated_at DESC 
-                LIMIT %d";
-
-        array_unshift($params, $query);
-
-        return $this->wpdb->get_results(
-            $this->wpdb->prepare($sql, $params)
+        // Use prepared statement with proper escaping
+        $sql = $this->wpdb->prepare(
+            "SELECT *, 
+             MATCH(title, content) AGAINST(%s IN NATURAL LANGUAGE MODE) as relevance
+             FROM {$this->scraped_content_table} 
+             WHERE status = 'active' AND ({$where_sql})
+             ORDER BY relevance DESC, updated_at DESC 
+             LIMIT %d",
+            $query,
+            $limit
         );
+
+        $results = $this->wpdb->get_results($sql);
+
+        // Additional security: sanitize results
+        if (is_array($results)) {
+            foreach ($results as $result) {
+                $result->title = sanitize_text_field($result->title);
+                $result->content = wp_kses_post($result->content);
+                $result->url = esc_url_raw($result->url);
+            }
+        }
+
+        return $results ?: array();
     }
 
     /**

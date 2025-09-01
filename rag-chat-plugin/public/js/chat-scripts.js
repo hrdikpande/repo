@@ -178,7 +178,7 @@
             // Show typing indicator
             this.showTyping($messagesArea);
             
-            // Send to API
+            // Send to API with enhanced error handling
             const data = {
                 action: 'rag_chat_send_message',
                 message: message,
@@ -187,46 +187,73 @@
                 nonce: ragChat.nonce
             };
 
-            $.ajax({
-                url: ragChat.ajaxUrl,
-                type: 'POST',
-                data: data,
-                timeout: 30000,
-                success: (response) => {
-                    this.hideTyping($messagesArea);
-                    
-                    if (response.success && response.data.message) {
-                        this.addMessage(response.data.message, 'bot', $messagesArea);
+            // Add request timeout and retry logic
+            const makeRequest = (retryCount = 0) => {
+                $.ajax({
+                    url: ragChat.ajaxUrl,
+                    type: 'POST',
+                    data: data,
+                    timeout: 30000,
+                    success: (response) => {
+                        this.hideTyping($messagesArea);
                         
-                        // Update session ID if provided
-                        if (response.data.session_id) {
-                            sessionId = response.data.session_id;
+                        if (response.success && response.data.message) {
+                            this.addMessage(response.data.message, 'bot', $messagesArea, false, response.data);
+                            
+                            // Update session ID if provided
+                            if (response.data.session_id) {
+                                sessionId = response.data.session_id;
+                            }
+                            
+                            // Show cache indicator if response was cached
+                            if (response.data.cached) {
+                                this.showCacheIndicator($messagesArea);
+                            }
+                        } else {
+                            const errorMsg = response.data?.message || ragChat.strings.error_message;
+                            this.addMessage(errorMsg, 'bot', $messagesArea, true);
                         }
-                    } else {
-                        const errorMsg = response.data?.message || ragChat.strings.error_message;
-                        this.addMessage(errorMsg, 'bot', $messagesArea, true);
+                    },
+                    error: (xhr, status, error) => {
+                        this.hideTyping($messagesArea);
+                        
+                        let errorMessage = ragChat.strings.network_error;
+                        
+                        // Handle specific error types
+                        if (status === 'timeout') {
+                            errorMessage = 'Request timed out. Please try again.';
+                        } else if (xhr.status === 429) {
+                            errorMessage = ragChat.strings.rate_limited;
+                        } else if (xhr.status === 413) {
+                            errorMessage = ragChat.strings.message_too_long;
+                        } else if (xhr.status >= 500) {
+                            errorMessage = 'Server error. Please try again later.';
+                        }
+                        
+                        this.addMessage(errorMessage, 'bot', $messagesArea, true);
+                        
+                        // Retry logic for network errors
+                        if (retryCount < 2 && (status === 'timeout' || xhr.status >= 500)) {
+                            setTimeout(() => {
+                                this.addMessage('Retrying...', 'bot', $messagesArea);
+                                makeRequest(retryCount + 1);
+                            }, 2000);
+                        }
+                        
+                        console.error('RAG Chat Error:', {status, error, xhr: xhr.responseText});
                     }
-                },
-                error: (xhr, status, error) => {
-                    this.hideTyping($messagesArea);
-                    
-                    let errorMessage = ragChat.strings.network_error;
-                    if (status === 'timeout') {
-                        errorMessage = 'Request timed out. Please try again.';
-                    }
-                    
-                    this.addMessage(errorMessage, 'bot', $messagesArea, true);
-                    console.error('RAG Chat Error:', error);
-                }
-            });
+                });
+            };
+            
+            makeRequest();
         }
 
-        addMessage(text, sender, $messagesArea, isError = false) {
+        addMessage(text, sender, $messagesArea, isError = false, responseData = null) {
             const timestamp = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
             const avatar = sender === 'user' ? '👤' : '🤖';
             const messageClass = `rag-chat-message rag-chat-message-${sender}${isError ? ' rag-chat-message-error' : ''}`;
             
-            const messageHtml = `
+            let messageHtml = `
                 <div class="${messageClass}">
                     <div class="rag-chat-message-avatar">${avatar}</div>
                     <div class="rag-chat-message-content">
@@ -236,9 +263,28 @@
                 </div>
             `;
             
+            // Add response metadata if available
+            if (responseData && responseData.response_time) {
+                const responseTime = (responseData.response_time * 1000).toFixed(0);
+                messageHtml = messageHtml.replace(
+                    '<div class="rag-chat-message-time">',
+                    `<div class="rag-chat-message-time">Response time: ${responseTime}ms | `
+                );
+            }
+            
             $messagesArea.append(messageHtml);
             this.scrollToBottom($messagesArea);
             this.messageCount++;
+        }
+
+        showCacheIndicator($messagesArea) {
+            const cacheHtml = `
+                <div class="rag-chat-cache-indicator">
+                    <small>💾 Cached response</small>
+                </div>
+            `;
+            $messagesArea.append(cacheHtml);
+            this.scrollToBottom($messagesArea);
         }
 
         showTyping($messagesArea) {

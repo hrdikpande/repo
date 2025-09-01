@@ -44,6 +44,13 @@ class RAG_Chat_Handler {
     private $gemini_api;
 
     /**
+     * Logger instance
+     *
+     * @var RAG_Chat_Logger
+     */
+    private $logger;
+
+    /**
      * Get instance
      *
      * @return RAG_Chat_Handler
@@ -62,10 +69,11 @@ class RAG_Chat_Handler {
         $this->database = RAG_Chat_Database::get_instance();
         $this->rag_processor = new RAG_Chat_RAG_Processor();
         $this->gemini_api = new RAG_Chat_Gemini_API();
+        $this->logger = new RAG_Chat_Logger();
     }
 
     /**
-     * Process chat message and generate response
+     * Process chat message and generate response with enhanced security and error handling
      *
      * @param string $message User message
      * @param string $session_id Session ID
@@ -76,7 +84,7 @@ class RAG_Chat_Handler {
         $start_time = microtime(true);
         
         try {
-            // Sanitize input
+            // Enhanced input validation and sanitization
             $message = RAG_Chat_Security::sanitize_message($message);
             $session_id = sanitize_text_field($session_id);
             
@@ -84,16 +92,46 @@ class RAG_Chat_Handler {
                 return $this->create_error_response('Message cannot be empty');
             }
 
+            // Check message length
+            $max_length = get_option('rag_chat_max_message_length', 1000);
+            if (strlen($message) > $max_length) {
+                return $this->create_error_response('Message is too long. Please shorten it.');
+            }
+
             // Check if chat is enabled
             if (!get_option('rag_chat_enabled', 1)) {
                 return $this->create_error_response('Chat service is currently disabled');
             }
 
+            // Rate limiting check
+            $rate_limiter = new RAG_Chat_Rate_Limiter();
+            if (!$rate_limiter->check_chat_rate_limit($session_id)) {
+                return $this->create_error_response('Too many messages. Please wait a moment.');
+            }
+
+            // Cache check for similar queries
+            $cache = new RAG_Chat_Cache();
+            $cache_key = 'chat_response_' . md5($message . $session_id);
+            $cached_response = $cache->get($cache_key);
+            
+            if ($cached_response !== null) {
+                return array_merge($cached_response, array(
+                    'cached' => true,
+                    'response_time' => microtime(true) - $start_time
+                ));
+            }
+
             // Analyze user intent
             $intent_analysis = $this->rag_processor->analyze_query_intent($message);
             
-            // Find relevant content
-            $relevant_content = $this->rag_processor->find_relevant_content($message, 10);
+            // Find relevant content with caching
+            $search_cache_key = 'search_' . md5($message);
+            $relevant_content = $cache->get($search_cache_key);
+            
+            if ($relevant_content === null) {
+                $relevant_content = $this->rag_processor->find_relevant_content($message, 10);
+                $cache->set($search_cache_key, $relevant_content, 1800); // Cache for 30 minutes
+            }
             
             // Get recent chat history
             $chat_history = $this->database->get_chat_history($session_id, 5);
@@ -105,7 +143,7 @@ class RAG_Chat_Handler {
                 $chat_history
             );
             
-            // Generate AI response
+            // Generate AI response with error handling
             $ai_response = $this->gemini_api->generate_response($prepared_context);
             
             $response_time = microtime(true) - $start_time;
@@ -119,7 +157,8 @@ class RAG_Chat_Handler {
                     'message' => $fallback_response,
                     'is_fallback' => true,
                     'relevant_content_count' => count($relevant_content),
-                    'response_time' => $response_time
+                    'response_time' => $response_time,
+                    'error_details' => $ai_response['message']
                 );
             } else {
                 $response_data = array(
@@ -128,20 +167,28 @@ class RAG_Chat_Handler {
                     'is_fallback' => false,
                     'relevant_content_count' => count($relevant_content),
                     'response_time' => $response_time,
-                    'token_count' => isset($ai_response['token_count']) ? $ai_response['token_count'] : 0
+                    'token_count' => isset($ai_response['token_count']) ? $ai_response['token_count'] : 0,
+                    'intent' => $intent_analysis
                 );
                 
                 // Update API usage statistics
                 $this->gemini_api->update_usage_statistics($ai_response);
+                
+                // Cache successful response
+                $cache->set($cache_key, $response_data, 3600); // Cache for 1 hour
             }
             
-            // Store chat history
-            $this->store_chat_history($session_id, $message, $response_data, $relevant_content, $context);
+            // Store chat history asynchronously
+            $this->store_chat_history_async($session_id, $message, $response_data, $relevant_content, $context);
             
             return $response_data;
             
         } catch (Exception $e) {
-            error_log('RAG Chat Handler Error: ' . $e->getMessage());
+            $this->logger->error('Chat processing error', array(
+                'error' => $e->getMessage(),
+                'message' => $message,
+                'session_id' => $session_id
+            ));
             
             return $this->create_error_response(
                 'An unexpected error occurred while processing your message',
@@ -174,6 +221,49 @@ class RAG_Chat_Handler {
         $fallback .= "If you need more specific information, please try rephrasing your question or contact our support team.";
         
         return $fallback;
+    }
+
+    /**
+     * Store chat interaction in database asynchronously
+     *
+     * @param string $session_id Session ID
+     * @param string $user_message User message
+     * @param array $response_data Response data
+     * @param array $relevant_content Relevant content used
+     * @param array $context Additional context
+     */
+    private function store_chat_history_async($session_id, $user_message, $response_data, $relevant_content, $context) {
+        // Store immediately for now, but could be made truly async with wp_schedule_single_event
+        try {
+            $chat_data = array(
+                'session_id' => $session_id,
+                'user_id' => get_current_user_id(),
+                'user_ip' => RAG_Chat_Security::get_user_ip(),
+                'user_message' => $user_message,
+                'bot_response' => $response_data['message'],
+                'context_used' => json_encode(array(
+                    'relevant_content_ids' => array_map(function($item) {
+                        return $item['content']->id;
+                    }, $relevant_content),
+                    'content_count' => count($relevant_content),
+                    'is_fallback' => $response_data['is_fallback'],
+                    'token_count' => isset($response_data['token_count']) ? $response_data['token_count'] : 0,
+                    'cached' => isset($response_data['cached']) ? $response_data['cached'] : false,
+                    'intent' => isset($response_data['intent']) ? $response_data['intent'] : null
+                )),
+                'response_time' => $response_data['response_time'],
+                'user_agent' => !empty($_SERVER['HTTP_USER_AGENT']) ? $_SERVER['HTTP_USER_AGENT'] : '',
+                'page_url' => isset($context['page_url']) ? $context['page_url'] : ''
+            );
+            
+            $this->database->insert_chat_history($chat_data);
+            
+        } catch (Exception $e) {
+            $this->logger->error('Error storing chat history', array(
+                'error' => $e->getMessage(),
+                'session_id' => $session_id
+            ));
+        }
     }
 
     /**
